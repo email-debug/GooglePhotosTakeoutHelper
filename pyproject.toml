@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "google-photos-takeout-helper-enhanced"
+dynamic = ["version"]
+description = "Organise Google Photos Takeout — with cross-folder sidecar matching, prescan, local photo merge, and test-batch limiter."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "TheLastGimbus", email = ""},
+    {name = "Tim Maas"},
+]
+keywords = ["google-photos", "takeout", "photos", "organize", "exif"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Utilities",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "Pillow",
+    "piexif",
+    "requests",
+    "portalocker",
+]
+
+[project.optional-dependencies]
+dev = ["build", "twine"]
+
+[project.scripts]
+gpth = "google_photos_takeout_helper.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/GooglePhotosTakeoutHelper"
+"Original Project" = "https://github.com/TheLastGimbus/GooglePhotosTakeoutHelper"
+"Bug Tracker" = "https://github.com/YOUR_USERNAME/GooglePhotosTakeoutHelper/issues"
+
+[tool.setuptools.dynamic]
+version = {attr = "google_photos_takeout_helper.__version__.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["google_photos_takeout_helper*"]
