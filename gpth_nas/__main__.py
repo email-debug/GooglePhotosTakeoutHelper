@@ -30,6 +30,7 @@ from google_photos_takeout_helper_v2.utils import (
 
 from .albums import build_album_map, create_album_shortcuts
 from .cli import parse
+from .extract import extract_all_zips
 from .index_db import IndexDB
 from .matching import match_media
 
@@ -39,7 +40,7 @@ from .matching import match_media
 
 def _is_json_sidecar(name: str) -> bool:
     nl = name.lower()
-    return nl.endswith('.json') and nl not in {'metadata.json'}
+    return nl.endswith('.json') and nl != 'metadata.json'
 
 
 def _is_media(name: str) -> bool:
@@ -203,16 +204,18 @@ def copy_pass(
     db: IndexDB,
     limit: Optional[int],
     delete_source: bool,
+    skip_existing: bool,
     skip_exif_write: bool,
     divide_to_dates: bool,
     force_rematch: bool,
-) -> Tuple[int, int, int]:
+) -> Tuple[int, int, int, int]:
     """
-    For every media file in src, ensure it's matched (re-run match if not),
-    then copy to the date-organized destination. Returns (seen, copied, errors).
+    For every media file in src, ensure it's matched (re-match if not), then
+    copy to the date-organized destination. Returns (seen, copied, skipped, errors).
     """
     seen = 0
     copied = 0
+    skipped = 0
     errors = 0
     last_print = time.time()
     db.begin()
@@ -224,10 +227,7 @@ def copy_pass(
         seen += 1
 
         prior = db.get_processed(media_path)
-        if prior and prior['status'] == 'copied' and not force_rematch:
-            # Already done — skip.
-            if limit and copied >= limit:
-                break
+        if prior and prior['status'] in ('copied', 'skipped_existing') and not force_rematch:
             continue
 
         if prior and not force_rematch:
@@ -246,8 +246,33 @@ def copy_pass(
         else:
             dest = dst / media_path.name
 
+        # Skip-existing: if a file with this exact dest path already exists,
+        # don't touch it. This is the "skip existing" fast path for re-runs
+        # against an output tree that's already mostly populated.
+        if skip_existing and dest.exists():
+            db.mark_processed(
+                media_path=media_path,
+                json_path=result_json,
+                match_type=result_match_type,
+                dest_path=dest,
+                status='skipped_existing',
+            )
+            skipped += 1
+            batch += 1
+            if batch >= 500:
+                db.commit()
+                db.begin()
+                batch = 0
+            if time.time() - last_print > 2.0:
+                print(f'  [copy] seen {seen:,} | copied {copied:,} | skipped {skipped:,} | errors {errors}', end='\r', flush=True)
+                last_print = time.time()
+            if limit and copied >= limit:
+                break
+            continue
+
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest = _unique_path(dest)
+        if not skip_existing:
+            dest = _unique_path(dest)
 
         try:
             shutil.copy2(media_path, dest)
@@ -304,13 +329,13 @@ def copy_pass(
             db.begin()
             batch = 0
         if time.time() - last_print > 2.0:
-            print(f'  [copy] seen {seen:,} | copied {copied:,} | errors {errors}', end='\r', flush=True)
+            print(f'  [copy] seen {seen:,} | copied {copied:,} | skipped {skipped:,} | errors {errors}', end='\r', flush=True)
             last_print = time.time()
         if limit and copied >= limit:
             break
     db.commit()
-    print(f'[copy] seen {seen:,} | copied {copied:,} | errors {errors}                  ')
-    return seen, copied, errors
+    print(f'[copy] seen {seen:,} | copied {copied:,} | skipped {skipped:,} | errors {errors}              ')
+    return seen, copied, skipped, errors
 
 
 def print_report(db: IndexDB) -> None:
@@ -343,6 +368,15 @@ def print_report(db: IndexDB) -> None:
 # ── command entry points ─────────────────────────────────────────────────
 
 
+def cmd_extract(args):
+    extract_all_zips(
+        zip_dir=args.zips,
+        staging=args.staging,
+        delete_after=not args.keep_zips,
+        dry_run=args.dry_run,
+    )
+
+
 def cmd_prescan(args):
     with IndexDB(args.db) as db:
         if args.force_rescan:
@@ -362,6 +396,7 @@ def cmd_prescan(args):
 
 
 def cmd_run(args):
+    skip_existing = not args.overwrite and args.skip_existing
     with IndexDB(args.db) as db:
         if db.count_json() == 0:
             ingest_jsons(args.src, db)
@@ -376,6 +411,7 @@ def cmd_run(args):
             db=db,
             limit=args.limit,
             delete_source=args.delete_source,
+            skip_existing=skip_existing,
             skip_exif_write=args.skip_exif_write,
             divide_to_dates=args.divide_to_dates,
             force_rematch=args.force_rematch,
@@ -407,6 +443,7 @@ def cmd_report(args):
 def main(argv=None):
     args = parse(argv)
     {
+        'extract': cmd_extract,
         'prescan': cmd_prescan,
         'run':     cmd_run,
         'albums':  cmd_albums,

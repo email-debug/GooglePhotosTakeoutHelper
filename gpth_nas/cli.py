@@ -1,4 +1,4 @@
-"""CLI for gpth-nas. Four subcommands: prescan, run, albums, report."""
+"""CLI for gpth-nas. Subcommands: extract, prescan, run, albums, report."""
 import argparse
 from pathlib import Path
 
@@ -10,12 +10,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest='cmd', required=True)
 
+    # ── extract ────────────────────────────────────────────────────────
+    ex = sub.add_parser(
+        'extract',
+        help='Extract Google Takeout *.zip files into a staging tree, deleting each zip after extraction.',
+    )
+    ex.add_argument('--zips', required=True, type=Path, help='Folder containing *.zip files')
+    ex.add_argument('--staging', required=True, type=Path, help='Folder to extract into (created if missing)')
+    ex.add_argument('--keep-zips', action='store_true', help='Do NOT delete each zip after a successful extract.')
+    ex.add_argument('--dry-run', action='store_true', help='List zips that would be extracted, do nothing.')
+
     # ── prescan ────────────────────────────────────────────────────────
     pre = sub.add_parser(
         'prescan',
         help='Build / refresh the JSON sidecar index and report match rate. No files copied.',
     )
-    pre.add_argument('--src', required=True, type=Path, help='Takeout source root')
+    pre.add_argument('--src', required=True, type=Path, help='Takeout source root (extracted)')
     pre.add_argument('--db', required=True, type=Path, help='Path to SQLite index file')
     pre.add_argument('--limit', type=int, default=None,
                      help='Only attempt matching on the first N media files (still scans full tree for JSON).')
@@ -36,6 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help='After copy phase, generate Albums/<name>/*.lnk shortcuts.')
     run.add_argument('--delete-source', action='store_true',
                      help='Delete each source file after a verified copy.')
+    run.add_argument('--skip-existing', action='store_true', default=True,
+                     help='If a file already exists at the dest path, skip without copying (default ON).')
+    run.add_argument('--overwrite', action='store_true',
+                     help='Disable --skip-existing: rewrite files even if dest already exists.')
     run.add_argument('--skip-exif-write', action='store_true',
                      help='Do not write EXIF dates on copied files (faster, less safe).')
     run.add_argument('--divide-to-dates', action='store_true', default=True,
