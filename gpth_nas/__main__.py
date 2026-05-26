@@ -285,16 +285,17 @@ def copy_pass(
                     pass
                 if json_info and json_info.get('geo_lat') is not None:
                     try:
-                        set_file_geo_data(
-                            dest,
-                            json_info['geo_lat'],
-                            json_info['geo_lon'],
-                            json_info.get('geo_alt') or 0,
-                        )
+                        set_file_geo_data(dest, {
+                            'geoData': {
+                                'latitude': json_info['geo_lat'],
+                                'longitude': json_info['geo_lon'],
+                                'altitude': json_info.get('geo_alt') or 0,
+                            }
+                        })
                     except Exception:
                         pass
                 try:
-                    set_file_timestamps(dest, date)
+                    set_file_timestamps(dest, date_str)
                 except Exception:
                     pass
 

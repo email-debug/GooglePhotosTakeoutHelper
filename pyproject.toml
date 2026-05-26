@@ -33,13 +33,18 @@ dependencies = [
     "piexif",
     "requests",
     "portalocker",
+    "loguru",
+    "tqdm",
 ]
 
 [project.optional-dependencies]
-dev = ["build", "twine"]
+dev = ["build", "twine", "pytest"]
+windows = ["pywin32"]
 
 [project.scripts]
 gpth = "google_photos_takeout_helper.__main__:main"
+gpth-v2 = "google_photos_takeout_helper_v2.__main__:main"
+gpth-nas = "gpth_nas.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/YOUR_USERNAME/GooglePhotosTakeoutHelper"
@@ -51,4 +56,4 @@ version = {attr = "google_photos_takeout_helper.__version__.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["google_photos_takeout_helper*"]
+include = ["google_photos_takeout_helper", "google_photos_takeout_helper_v2", "gpth_nas"]
