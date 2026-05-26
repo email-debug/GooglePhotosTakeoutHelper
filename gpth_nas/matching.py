@@ -1,17 +1,25 @@
 """
 JSON sidecar matching for the NAS fork. Backed by SQLite (index_db).
 
-Eight strategies, tried in order of confidence. Each is independent of how the
+Strategies, tried in order of confidence. Each is independent of how the
 index is stored — they all go through IndexDB's query API.
 
   same_exact      Sidecar in the same folder, exact basename match.
   same_paren      Same folder, Google's IMG(1).jpg <-> IMG.jpg(1).json reorder.
-  same_edited     Same folder, '-edited' variant of the media name.
-  same_truncated  Same folder, Google truncated the JSON stem (e.g. 46 chars).
+  same_edited     Same folder, '-edited'/'-EFFECTS'/etc. variant of the media name.
+  same_truncated  Same folder, Google truncated the JSON filename to 51 chars.
   cross_exact     Any folder, exact basename match.
   cross_truncated Any folder, truncation strategy.
   cross_stem_pref Any folder, stem-prefix match (≥ 25 chars) for long unique names.
   title           JSON 'title' field equals the media filename.
+
+Truncation model (CRITICAL — verified against real Takeout exports):
+Google builds the sidecar name as `{media_filename}.supplemental-metadata.json`
+and then truncates the WHOLE name (before the trailing '.json') to 46 chars,
+re-appending '.json' — capping the full basename at 51 characters. The cut can
+land anywhere: in the '.supplemental-metadata' suffix ('.supplemental-me.json'),
+mid-extension ('.jp.json'), or even right after the media name ('foo.'). This
+is reconstructed exactly by `_expected_sidecar()`; we do NOT guess stem lengths.
 
 Collision resolution: when multiple candidates exist, prefer (1) same parent
 folder, (2) same year folder ("Photos from YYYY"), (3) closest stem length,
@@ -29,13 +37,19 @@ from .index_db import IndexDB
 MatchResult = namedtuple('MatchResult', ['json_path', 'match_type'])
 NO_MATCH = MatchResult(None, None)
 
-# Google's known JSON-stem truncation lengths. Empirically Google truncates the
-# embedded media filename to 46 chars (most common) or 51 in some exports.
-# We try a few common lengths plus a couple defensive ones.
-_TRUNC_LENS = (46, 47, 51, 50, 45, 44, 43, 42, 41, 40)
+# Google caps the sidecar basename at this many characters (incl. ".json").
+_MAX_JSON_LEN = 51
+_SUPP = '.supplemental-metadata'
 
+# Editor-generated variants that share the ORIGINAL photo's sidecar. Google
+# appends these before the extension: foo-edited.jpg, foo-EFFECTS.jpg, etc.
+_EDIT_SUFFIXES = (
+    '-edited', '-EFFECTS', '-COLLAGE', '-ANIMATION',
+    '-PANO', '-MIX', '-SMILE', '-MOTION',
+)
 
 _YEAR_RE = re.compile(r'\bfrom\s+((?:19|20)\d{2})\b', re.IGNORECASE)
+_PAREN_RE = re.compile(r'\((\d+)\)$')
 
 
 def _year_in_path(p: str) -> Optional[str]:
@@ -43,56 +57,81 @@ def _year_in_path(p: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _expected_sidecar(media_name: str) -> Tuple[str, bool]:
+    """
+    Reconstruct Google's sidecar basename for a media filename.
+
+    Returns (basename, was_truncated). The full form is
+    `{media_name}.supplemental-metadata.json`; if that exceeds 51 chars Google
+    truncates the pre-'.json' portion to 46 chars, yielding a 51-char basename.
+    """
+    full = media_name + _SUPP + '.json'
+    if len(full) <= _MAX_JSON_LEN:
+        return full, False
+    return (media_name + _SUPP)[: _MAX_JSON_LEN - len('.json')] + '.json', True
+
+
 def _build_candidate_names(media_name: str) -> List[str]:
-    """Generate name variants (without .json suffix) to try for sidecar lookup."""
+    """Generate media-name variants whose sidecar we should look for."""
     candidates = [media_name]
-    if '-edited' in media_name:
-        candidates.append(media_name.replace('-edited', ''))
-    # Strip "(1)" and "~1" duplicate markers.
-    stripped = re.sub(r'(\s*\(\d+\)|~\d+)', '', media_name)
+    stem, ext = _splitext(media_name)
+
+    # Editor variants share the original photo's sidecar.
+    for suf in _EDIT_SUFFIXES:
+        if stem.endswith(suf):
+            candidates.append(stem[: -len(suf)] + ext)
+
+    # Strip "(1)" / "~1" duplicate markers.
+    stripped = re.sub(r'(\s*\(\d+\)|~\d+)$', '', stem) + ext
     if stripped not in candidates:
         candidates.append(stripped)
+
     return candidates
 
 
-def _sidecar_basenames(cname: str) -> List[str]:
-    """All JSON basenames to try for a given media-name candidate."""
-    out = []
-    parens = re.findall(r'\([0-9]+\)', cname)
-    stem = Path(cname).stem
+def _splitext(name: str) -> Tuple[str, str]:
+    p = Path(name)
+    return p.stem, p.suffix
+
+
+def _sidecar_basenames(cname: str) -> List[Tuple[str, str]]:
+    """
+    All (json_basename, kind) pairs to try for a media-name candidate.
+
+    kind is 'exact' | 'truncated' | 'paren'. The caller prefixes 'same_'/'cross_'.
+    """
+    out: List[Tuple[str, str]] = []
+    stem, ext = _splitext(cname)
 
     # Paren reorder: foo(1).jpg -> foo.jpg(1).json
-    if len(parens) == 1:
-        without = re.sub(r'\([0-9]+\)', '', cname)
-        with_paren_after = without + parens[0]
-        out.append(with_paren_after + '.json')
-        out.append(with_paren_after + '.supplemental-metadata.json')
+    m = _PAREN_RE.search(stem)
+    if m:
+        reordered = stem[: m.start()] + ext + '(' + m.group(1) + ')'
+        out.append((reordered + '.json', 'paren'))
+        out.append((reordered + _SUPP + '.json', 'paren'))
 
-    # Standard
-    out.append(cname + '.json')
-    out.append(cname + '.supplemental-metadata.json')
+    # Primary: Google's exact (possibly truncated) sidecar name.
+    expected, truncated = _expected_sidecar(cname)
+    out.append((expected, 'truncated' if truncated else 'exact'))
 
-    # Stem-only (filename without media extension)
+    # Legacy / alternate forms.
+    out.append((cname + '.json', 'exact'))
     if stem and stem != cname:
-        out.append(stem + '.json')
-        out.append(stem + '.supplemental-metadata.json')
+        out.append((stem + '.json', 'exact'))
+        out.append((stem + _SUPP + '.json', 'exact'))
 
-    # Deduplicate, preserve order
+    # Deduplicate, preserve order.
     seen = set()
     deduped = []
-    for b in out:
-        if b not in seen:
-            seen.add(b)
-            deduped.append(b)
+    for bn, kind in out:
+        if bn not in seen:
+            seen.add(bn)
+            deduped.append((bn, kind))
     return deduped
 
 
 def _pick_best(candidates: List[str], media_parent: str, media_name: str) -> Optional[str]:
-    """
-    Choose the single best JSON path from a candidate list using locality heuristics.
-
-    Returns None for empty input. Returns the only entry for single-element lists.
-    """
+    """Choose the single best JSON path from a candidate list using locality heuristics."""
     if not candidates:
         return None
     if len(candidates) == 1:
@@ -108,7 +147,6 @@ def _pick_best(candidates: List[str], media_parent: str, media_name: str) -> Opt
         same_year = (media_year is not None and j_year == media_year)
         j_stem = IndexDB._stem_of_json(Path(jp).name)
         len_diff = abs(len(j_stem) - media_stem_len)
-        # Sort key: same_parent first (True > False so negate), then same_year, then small len_diff, then lex.
         return (
             0 if same_parent else 1,
             0 if same_year else 1,
@@ -125,64 +163,40 @@ def match_media(media_path: Path, db: IndexDB) -> MatchResult:
     media_parent = str(media_path.parent)
     candidate_names = _build_candidate_names(media_name)
 
-    # ── same-folder: exact / paren / edited (Strategies 1-3 collapsed) ───
+    def label(kind: str, cname: str, scope: str) -> str:
+        # scope is 'same' or 'cross'.
+        if cname != media_name:
+            stem, _ = _splitext(media_name)
+            if any(stem.endswith(s) for s in _EDIT_SUFFIXES):
+                return scope + '_edited'
+            return scope + '_paren'
+        if kind == 'truncated':
+            return scope + '_truncated'
+        if kind == 'paren':
+            return scope + '_paren'
+        return scope + '_exact'
+
+    # ── same-folder ──────────────────────────────────────────────────────
     for cname in candidate_names:
-        for bn in _sidecar_basenames(cname):
+        for bn, kind in _sidecar_basenames(cname):
             hit = db.in_parent_with_basename(media_parent, bn)
             if hit:
-                mt = 'same_exact'
-                if cname != media_name:
-                    mt = 'same_edited' if '-edited' in media_name else 'same_paren'
-                return MatchResult(hit, mt)
+                return MatchResult(hit, label(kind, cname, 'same'))
 
-    # ── same-folder: truncation (Google often truncates the embedded name) ─
-    media_stem = Path(media_name).stem
-    media_ext = Path(media_name).suffix
-    if len(media_stem) > min(_TRUNC_LENS):
-        for tl in _TRUNC_LENS:
-            if tl >= len(media_stem):
-                continue
-            truncated_stem = media_stem[:tl]
-            for try_basename in (
-                truncated_stem + media_ext + '.json',
-                truncated_stem + media_ext + '.supplemental-metadata.json',
-                truncated_stem + '.json',
-            ):
-                hit = db.in_parent_with_basename(media_parent, try_basename)
-                if hit:
-                    return MatchResult(hit, 'same_truncated')
-
-    # ── cross-folder: exact / paren / edited ─────────────────────────────
+    # ── cross-folder ─────────────────────────────────────────────────────
     for cname in candidate_names:
-        for bn in _sidecar_basenames(cname):
+        for bn, kind in _sidecar_basenames(cname):
             hits = db.by_basename(bn)
             best = _pick_best(hits, media_parent, media_name)
             if best:
-                return MatchResult(best, 'cross_exact')
-
-    # ── cross-folder: truncation ─────────────────────────────────────────
-    if len(media_stem) > min(_TRUNC_LENS):
-        for tl in _TRUNC_LENS:
-            if tl >= len(media_stem):
-                continue
-            truncated_stem = media_stem[:tl]
-            for try_basename in (
-                truncated_stem + media_ext + '.json',
-                truncated_stem + media_ext + '.supplemental-metadata.json',
-                truncated_stem + '.json',
-            ):
-                hits = db.by_basename(try_basename)
-                best = _pick_best(hits, media_parent, media_name)
-                if best:
-                    return MatchResult(best, 'cross_truncated')
+                return MatchResult(best, label(kind, cname, 'cross'))
 
     # ── cross-folder: stem-prefix for long unique names ──────────────────
     # Only safe for stems ≥ 25 chars (otherwise prefix collisions explode).
+    media_stem = Path(media_name).stem
     if len(media_stem) >= 25:
         prefix = media_stem[:25]
         rows = db.by_stem_prefix(prefix, limit=64)
-        # Filter to ones that the media stem actually starts with their JSON stem
-        # (truncation case) OR that start with the media stem (extension variants).
         candidate_paths = []
         for jp, jstem in rows:
             j_stem_core = Path(jstem).stem
@@ -195,7 +209,6 @@ def match_media(media_path: Path, db: IndexDB) -> MatchResult:
     # ── title field match ────────────────────────────────────────────────
     title_hits = db.by_title(media_name)
     if title_hits:
-        # Prefer same parent.
         same_parent_hits = [p for p, par in title_hits if par == media_parent]
         if same_parent_hits:
             return MatchResult(same_parent_hits[0], 'same_title')

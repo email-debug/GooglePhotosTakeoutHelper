@@ -52,6 +52,13 @@ CREATE INDEX IF NOT EXISTS idx_proc_match  ON processed(match_type);
 """
 
 
+def _as_float(v):
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 class IndexDB:
     def __init__(self, db_path):
         self.path = Path(db_path)
@@ -110,17 +117,19 @@ class IndexDB:
         taken_ts = None
         lat = lon = alt = None
         if isinstance(parsed, dict):
-            title = parsed.get('title')
+            raw_title = parsed.get('title')
+            title = raw_title if isinstance(raw_title, str) else None
             t = parsed.get('photoTakenTime') or parsed.get('creationTime') or {}
-            try:
-                taken_ts = int(t.get('timestamp')) if t and t.get('timestamp') else None
-            except (TypeError, ValueError):
-                taken_ts = None
+            if isinstance(t, dict):
+                try:
+                    taken_ts = int(t.get('timestamp')) if t.get('timestamp') else None
+                except (TypeError, ValueError):
+                    taken_ts = None
             geo = parsed.get('geoData') or parsed.get('geoDataExif') or {}
             if isinstance(geo, dict):
-                lat = geo.get('latitude')
-                lon = geo.get('longitude')
-                alt = geo.get('altitude')
+                lat = _as_float(geo.get('latitude'))
+                lon = _as_float(geo.get('longitude'))
+                alt = _as_float(geo.get('altitude'))
         p = Path(path)
         basename = p.name
         stem = self._stem_of_json(basename)
