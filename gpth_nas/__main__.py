@@ -32,7 +32,12 @@ from .albums import build_album_map, create_album_shortcuts
 from .cli import parse
 from .extract import extract_all_zips
 from .index_db import IndexDB
-from .matching import match_media
+from .matching import (
+    _build_orphan_segment_index,
+    cleanup_match_via_index,
+    match_media,
+)
+from .media_db import MediaDB
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -148,15 +153,53 @@ def ingest_jsons(src: Path, db: IndexDB) -> int:
     return n
 
 
+def ingest_media(src: Path, mdb: MediaDB) -> int:
+    """Walk src once and persist every media file's metadata to MediaDB.
+    Lets the matcher and cleanup operate entirely off the index — no more
+    repeated filesystem walks per phase."""
+    print(f'[media-scan] walking {src} for media files...')
+    n = 0
+    mdb.begin()
+    batch = 0
+    last_print = time.time()
+    for entry in iterative_walk(src):
+        if not _is_media(entry.name):
+            continue
+        try:
+            st = entry.stat()
+            size = st.st_size
+            mtime = int(st.st_mtime)
+        except OSError:
+            size = mtime = None
+        mdb.upsert_media(entry.path, size_bytes=size, mtime=mtime)
+        n += 1
+        batch += 1
+        if batch >= 2000:
+            mdb.commit()
+            mdb.begin()
+            batch = 0
+        if time.time() - last_print > 2.0:
+            print(f'  [media-scan] {n:,} media indexed...', end='\r', flush=True)
+            last_print = time.time()
+    mdb.commit()
+    print(f'[media-scan] indexed {n:,} media files.            ')
+    return n
+
+
 def attempt_matches(
     src: Path,
     db: IndexDB,
     limit: Optional[int],
     status: str,
     skip_already_processed: bool = True,
+    mdb: Optional[MediaDB] = None,
 ) -> Tuple[int, int]:
     """
-    Walk src, match each media file, mark in `processed` with given status.
+    Match each media file and mark in `processed` with given status.
+
+    If `mdb` is provided, iterate from the MediaDB index (no filesystem walk).
+    Otherwise fall back to walking `src` — kept for compatibility, but the
+    in-DB path is faster and handles resumes.
 
     Returns (media_seen, matched).
     """
@@ -165,10 +208,18 @@ def attempt_matches(
     last_print = time.time()
     db.begin()
     batch = 0
-    for entry in iterative_walk(src):
-        if not _is_media(entry.name):
-            continue
-        media_path = Path(entry.path)
+
+    if mdb is not None:
+        source_iter = ((p, Path(p).name) for p in mdb.iter_all())
+    else:
+        source_iter = (
+            (entry.path, entry.name)
+            for entry in iterative_walk(src)
+            if _is_media(entry.name)
+        )
+
+    for media_path_str, name in source_iter:
+        media_path = Path(media_path_str)
         if skip_already_processed and db.get_processed(media_path):
             continue
         result = match_media(media_path, db)
@@ -196,6 +247,42 @@ def attempt_matches(
     db.commit()
     print(f'[match] {seen:,} media | {matched:,} matched              ')
     return seen, matched
+
+
+def cleanup_unmatched(db: IndexDB, status: str) -> int:
+    """
+    Final cleanup pass: re-match every row that the main strategies left
+    as 'unmatched' against the global orphan-JSON index. A media file is
+    rescued if exactly one orphan JSON shares its first segment.
+    Returns the number of stragglers newly matched.
+    """
+    rows = db.conn.execute(
+        "SELECT media_path FROM processed WHERE status=? AND match_type='unmatched'",
+        (status,),
+    ).fetchall()
+    if not rows:
+        return 0
+    print(f'[cleanup] building first-segment index...')
+    seg_idx = _build_orphan_segment_index(db)
+    total_jsons = sum(len(v) for v in seg_idx.values())
+    print(f'[cleanup] {total_jsons:,} sidecars across {len(seg_idx):,} unique '
+          f'first segments; re-matching {len(rows):,} stragglers...')
+    db.begin()
+    rescued = 0
+    for (media_path_str,) in rows:
+        result = cleanup_match_via_index(Path(media_path_str), seg_idx)
+        if result.json_path:
+            db.mark_processed(
+                media_path=media_path_str,
+                json_path=result.json_path,
+                match_type=result.match_type,
+                dest_path=None,
+                status=status,
+            )
+            rescued += 1
+    db.commit()
+    print(f'[cleanup] rescued {rescued:,} of {len(rows):,}.')
+    return rescued
 
 
 def copy_pass(
@@ -375,36 +462,63 @@ def cmd_extract(args):
         staging=args.staging,
         delete_after=not args.keep_zips,
         dry_run=args.dry_run,
+        limit=args.limit,
+        skip=args.skip,
     )
 
 
+def _media_db_path(args) -> Path:
+    return args.media_db or Path(str(args.db) + '.media.db')
+
+
 def cmd_prescan(args):
-    with IndexDB(args.db) as db:
+    mdb_path = _media_db_path(args)
+    with IndexDB(args.db) as db, MediaDB(mdb_path) as mdb:
         if args.force_rescan:
             db.conn.execute('DELETE FROM json_files')
             db.conn.execute('DELETE FROM processed')
+        if args.force_media_rescan:
+            mdb.conn.execute('DELETE FROM media_files')
+
         if args.force_rescan or db.count_json() == 0:
             ingest_jsons(args.src, db)
         else:
             print(f'[scan] reusing {db.count_json():,} indexed JSONs from {args.db}')
             print('       (pass --force-rescan to rebuild from disk)')
+
+        if args.force_media_rescan or mdb.count() == 0:
+            ingest_media(args.src, mdb)
+        else:
+            print(f'[media-scan] reusing {mdb.count():,} indexed media from {mdb_path}')
+            print('             (pass --force-media-rescan to rebuild from disk)')
+
         db.set_meta('source_root', str(args.src))
+        mdb.set_meta('source_root', str(args.src))
         # Wipe prior prescan results so the report reflects this run.
         db.conn.execute("DELETE FROM processed WHERE status='prescan'")
         attempt_matches(args.src, db, args.limit, status='prescan',
-                        skip_already_processed=False)
+                        skip_already_processed=False, mdb=mdb)
+        cleanup_unmatched(db, status='prescan')
         print_report(db)
 
 
 def cmd_run(args):
     skip_existing = not args.overwrite and args.skip_existing
-    with IndexDB(args.db) as db:
+    mdb_path = _media_db_path(args)
+    with IndexDB(args.db) as db, MediaDB(mdb_path) as mdb:
         if db.count_json() == 0:
             ingest_jsons(args.src, db)
         else:
             print(f'[scan] reusing {db.count_json():,} indexed JSONs from {args.db}')
+        if mdb.count() == 0:
+            ingest_media(args.src, mdb)
+        else:
+            print(f'[media-scan] reusing {mdb.count():,} indexed media from {mdb_path}')
         db.set_meta('source_root', str(args.src))
+        mdb.set_meta('source_root', str(args.src))
         db.set_meta('dest_root', str(args.dst))
+
+        cleanup_unmatched(db, status='prescan')
 
         copy_pass(
             src=args.src,

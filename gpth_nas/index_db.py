@@ -193,6 +193,24 @@ class IndexDB:
         ).fetchall()
         return [(p, par) for p, par in rows]
 
+    def in_parent_with_title_stem(self, parent: str, stem: str) -> List[str]:
+        """JSONs in `parent` whose 'title' field is `{stem}.{ext}` — i.e. a
+        sibling media of the same stem but different extension. Used for the
+        Live Photo case: a `.MP4` motion clip borrows its `.HEIC` sibling's
+        sidecar."""
+        rows = self.conn.execute(
+            "SELECT path, title FROM json_files WHERE parent=? AND title LIKE ?",
+            (parent, stem + '.%'),
+        ).fetchall()
+        out: List[str] = []
+        for path, title in rows:
+            if not title or '.' not in title:
+                continue
+            t_stem, _, _ = title.rpartition('.')
+            if t_stem == stem:
+                out.append(path)
+        return out
+
     def get_raw_json(self, path: str):
         r = self.conn.execute(
             "SELECT raw_json FROM json_files WHERE path=?", (path,)

@@ -18,6 +18,8 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument('--zips', required=True, type=Path, help='Folder containing *.zip files')
     ex.add_argument('--staging', required=True, type=Path, help='Folder to extract into (created if missing)')
     ex.add_argument('--keep-zips', action='store_true', help='Do NOT delete each zip after a successful extract.')
+    ex.add_argument('--limit', type=int, default=None, help='Only extract the first N zips (sorted by name).')
+    ex.add_argument('--skip', type=int, default=0, help='Skip the first N zips (sorted by name) before extracting.')
     ex.add_argument('--dry-run', action='store_true', help='List zips that would be extracted, do nothing.')
 
     # ── prescan ────────────────────────────────────────────────────────
@@ -26,11 +28,16 @@ def build_parser() -> argparse.ArgumentParser:
         help='Build / refresh the JSON sidecar index and report match rate. No files copied.',
     )
     pre.add_argument('--src', required=True, type=Path, help='Takeout source root (extracted)')
-    pre.add_argument('--db', required=True, type=Path, help='Path to SQLite index file')
+    pre.add_argument('--db', required=True, type=Path, help='Path to JSON sidecar index (SQLite)')
+    pre.add_argument('--media-db', type=Path, default=None,
+                     help='Path to media-file index (SQLite). If omitted, defaults to '
+                          '<db>.media.db next to --db. Allows separate re-scans of media vs JSON.')
     pre.add_argument('--limit', type=int, default=None,
                      help='Only attempt matching on the first N media files (still scans full tree for JSON).')
     pre.add_argument('--force-rescan', action='store_true',
-                     help='Discard existing index in db and rebuild from scratch.')
+                     help='Discard existing JSON index and rebuild from scratch.')
+    pre.add_argument('--force-media-rescan', action='store_true',
+                     help='Discard existing media index and rebuild from scratch.')
 
     # ── run ────────────────────────────────────────────────────────────
     run = sub.add_parser(
@@ -40,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument('--src', required=True, type=Path)
     run.add_argument('--dst', required=True, type=Path)
     run.add_argument('--db', required=True, type=Path)
+    run.add_argument('--media-db', type=Path, default=None,
+                     help='Path to media-file index. Defaults to <db>.media.db.')
     run.add_argument('--limit', type=int, default=None,
                      help='Stop after N media files (testing).')
     run.add_argument('--albums', action='store_true',
