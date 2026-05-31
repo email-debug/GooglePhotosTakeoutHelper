@@ -33,7 +33,7 @@ from .cli import parse
 from .extract import extract_all_zips
 from .index_db import IndexDB
 from .matching import (
-    _build_orphan_segment_index,
+    _build_segment_index,
     cleanup_match_via_index,
     match_media,
 )
@@ -154,9 +154,13 @@ def ingest_jsons(src: Path, db: IndexDB) -> int:
 
 
 def ingest_media(src: Path, mdb: MediaDB) -> int:
-    """Walk src once and persist every media file's metadata to MediaDB.
-    Lets the matcher and cleanup operate entirely off the index — no more
-    repeated filesystem walks per phase."""
+    """Walk src once and persist every media filename to MediaDB.
+
+    Path + parent + ext + first_seg are all that's needed downstream; we
+    skip the per-file stat() that DirEntry.stat() would trigger on Linux
+    (it's a real syscall there, not a scandir-cached d_type read). Saves
+    a stat-per-file on slow NAS storage where the walk dominates.
+    """
     print(f'[media-scan] walking {src} for media files...')
     n = 0
     mdb.begin()
@@ -165,13 +169,7 @@ def ingest_media(src: Path, mdb: MediaDB) -> int:
     for entry in iterative_walk(src):
         if not _is_media(entry.name):
             continue
-        try:
-            st = entry.stat()
-            size = st.st_size
-            mtime = int(st.st_mtime)
-        except OSError:
-            size = mtime = None
-        mdb.upsert_media(entry.path, size_bytes=size, mtime=mtime)
+        mdb.upsert_media(entry.path)
         n += 1
         batch += 1
         if batch >= 2000:
@@ -210,15 +208,13 @@ def attempt_matches(
     batch = 0
 
     if mdb is not None:
-        source_iter = ((p, Path(p).name) for p in mdb.iter_all())
+        source_iter = mdb.iter_all()
     else:
         source_iter = (
-            (entry.path, entry.name)
-            for entry in iterative_walk(src)
-            if _is_media(entry.name)
+            entry.path for entry in iterative_walk(src) if _is_media(entry.name)
         )
 
-    for media_path_str, name in source_iter:
+    for media_path_str in source_iter:
         media_path = Path(media_path_str)
         if skip_already_processed and db.get_processed(media_path):
             continue
@@ -251,10 +247,14 @@ def attempt_matches(
 
 def cleanup_unmatched(db: IndexDB, status: str) -> int:
     """
-    Final cleanup pass: re-match every row that the main strategies left
-    as 'unmatched' against the global orphan-JSON index. A media file is
-    rescued if exactly one orphan JSON shares its first segment.
-    Returns the number of stragglers newly matched.
+    Re-match every row the main strategies left as 'unmatched' against the
+    global first-segment uniqueness index. A media file is rescued only if
+    exactly one sidecar shares its first segment — that uniqueness check
+    is what makes the wider search safe.
+
+    Returns the number of stragglers newly matched. Skips building the
+    segment index entirely when there's nothing left to rescue, so chaining
+    prescan → run pays the cost only once.
     """
     rows = db.conn.execute(
         "SELECT media_path FROM processed WHERE status=? AND match_type='unmatched'",
@@ -263,7 +263,7 @@ def cleanup_unmatched(db: IndexDB, status: str) -> int:
     if not rows:
         return 0
     print(f'[cleanup] building first-segment index...')
-    seg_idx = _build_orphan_segment_index(db)
+    seg_idx = _build_segment_index(db)
     total_jsons = sum(len(v) for v in seg_idx.values())
     print(f'[cleanup] {total_jsons:,} sidecars across {len(seg_idx):,} unique '
           f'first segments; re-matching {len(rows):,} stragglers...')

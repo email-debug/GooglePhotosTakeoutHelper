@@ -12,11 +12,12 @@ Schema:
                  the first '-', '(' or '~' — the part Google preserves
                  across edit/paren variants. Indexed for cleanup queries.
 """
-import re
 import sqlite3
 import time
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
+
+from ._naming import MIN_FIRST_SEG, first_segment
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS media_files (
@@ -39,14 +40,6 @@ CREATE TABLE IF NOT EXISTS meta (
   v TEXT
 );
 """
-
-_FIRST_SEG_RE = re.compile(r'^([^-(~]+)')
-
-
-def _first_segment(stem: str) -> str:
-    m = _FIRST_SEG_RE.match(stem)
-    return m.group(1) if m else stem
-
 
 class MediaDB:
     def __init__(self, db_path):
@@ -90,15 +83,12 @@ class MediaDB:
 
     def upsert_media(self, path, size_bytes: Optional[int] = None, mtime: Optional[int] = None):
         p = Path(path)
-        basename = p.name
-        stem = p.stem
-        ext = p.suffix
         self.conn.execute(
             "INSERT OR REPLACE INTO media_files"
             "(path,basename,parent,stem,ext,first_seg,size_bytes,mtime)"
             " VALUES(?,?,?,?,?,?,?,?)",
-            (str(p), basename, str(p.parent), stem, ext,
-             _first_segment(stem), size_bytes, mtime),
+            (str(p), p.name, str(p.parent), p.stem, p.suffix,
+             first_segment(p.stem), size_bytes, mtime),
         )
 
     def count(self) -> int:

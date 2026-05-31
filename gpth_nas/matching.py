@@ -45,6 +45,7 @@ from collections import namedtuple
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from ._naming import MIN_FIRST_SEG, first_segment, splitext as _splitext_shared
 from .index_db import IndexDB
 
 
@@ -85,25 +86,51 @@ def _expected_sidecar(media_name: str) -> Tuple[str, bool]:
     return (media_name + _SUPP)[: _MAX_JSON_LEN - len('.json')] + '.json', True
 
 
+def _strip_edit_suffix(seed: str) -> Optional[str]:
+    """Return seed with its trailing edit-suffix removed, or None if none
+    is present. Handles both full ('-edited') and truncated ('-edite',
+    down to 3 chars) forms — Google's ~47-char filename cap sometimes
+    chops the marker mid-word and the matcher has to recognize that.
+
+    The 3-char floor is what keeps `foo-X.jpg` from being misread as a
+    truncated edit variant; shorter prefixes get rescued by the cleanup
+    pass instead, which is gated on global first-segment uniqueness."""
+    for suf in _EDIT_SUFFIXES:
+        if seed.endswith(suf):
+            return seed[: -len(suf)]
+    for suf in _EDIT_SUFFIXES:
+        for k in range(len(suf) - 1, 2, -1):
+            partial = suf[:k]
+            if seed.endswith(partial):
+                return seed[: -len(partial)]
+    return None
+
+
 def _build_candidate_names(media_name: str) -> List[str]:
     """Generate media-name variants whose sidecar we should look for.
 
-    Composes paren-stripping and edit-suffix-stripping so that
-    `foo-edited(1).jpg` also tries `foo.jpg` (Google's original-photo sidecar).
+    Composes three independent transforms Google may have applied:
+      - paren/tilde dupe markers ('foo(1).jpg', 'foo~2.jpg')
+      - edit-suffix insertion ('foo-edited.jpg')
+      - extension case folding (original '.JPG' vs Google's '-edited.jpg')
+
+    The marker is re-applied AFTER edit-stripping so 'foo-edited(1).jpg'
+    finds 'foo.jpg.supplemental-metadata(1).json' — without the re-application
+    it'd only reach the un-marked base sidecar and silently pick the wrong
+    one in folders where both exist.
     """
     candidates: List[str] = []
     stem, ext = _splitext(media_name)
+    swap_ext = ext.swapcase() if ext and ext != ext.swapcase() else None
 
-    def add(name: str) -> None:
-        if name not in candidates:
-            candidates.append(name)
+    def add(name_no_ext: str) -> None:
+        for e in (ext, swap_ext) if swap_ext else (ext,):
+            n = name_no_ext + e
+            if n not in candidates:
+                candidates.append(n)
 
-    add(media_name)
+    add(stem)
 
-    # Detect a trailing "(N)" / "~N" duplicate marker so it can be re-applied
-    # after edit-suffix stripping (otherwise foo-edited(1).jpg only reaches
-    # foo.jpg and loses the (1) — picking the wrong sidecar in a folder with
-    # both foo.jpg.supplemental-metadata.json and ...(1).json).
     m = re.search(r'(\s*\(\d+\)|~\d+)$', stem)
     paren_marker = m.group(1) if m else ''
     base = stem[: m.start()] if m else stem
@@ -113,38 +140,12 @@ def _build_candidate_names(media_name: str) -> List[str]:
         seeds.append((base, paren_marker))
 
     for seed, marker in seeds:
-        add(seed + ext)
-        for suf in _EDIT_SUFFIXES:
-            if seed.endswith(suf):
-                stripped = seed[: -len(suf)]
-                if marker:
-                    add(stripped + marker + ext)  # more specific first
-                add(stripped + ext)
-                break
-        else:
-            # Truncated edit-suffix: filename was cut mid-'-edited'/etc by
-            # Google's ~47-char cap. Trim any '-<prefix-of-edit-suffix>' (≥3 chars).
-            for suf in _EDIT_SUFFIXES:
-                for k in range(len(suf) - 1, 2, -1):
-                    partial = suf[:k]
-                    if seed.endswith(partial):
-                        stripped = seed[: -len(partial)]
-                        if marker:
-                            add(stripped + marker + ext)
-                        add(stripped + ext)
-                        break
-                else:
-                    continue
-                break
-
-    # Case-swap extension. Google preserves the source's ORIGINAL casing
-    # (often '.JPG' from older cameras) on the base photo while lowercasing
-    # the '-edited.jpg' variant — so the edit-stripped candidate misses the
-    # uppercase sidecar.
-    for cn in list(candidates):
-        s, e = _splitext(cn)
-        if e and e != e.swapcase():
-            add(s + e.swapcase())
+        add(seed)
+        stripped = _strip_edit_suffix(seed)
+        if stripped is not None:
+            if marker:
+                add(stripped + marker)  # more specific first
+            add(stripped)
 
     return candidates
 
@@ -321,17 +322,6 @@ def match_media(media_path: Path, db: IndexDB) -> MatchResult:
     return NO_MATCH
 
 
-_FIRST_SEG_RE = re.compile(r'^([^-(~]+)')
-_MIN_FIRST_SEG = 4
-
-
-def _first_segment(stem: str) -> str:
-    """Stem up to the first '-', '(' or '~' — the part Google preserves
-    intact across edit variants, paren dupes, and tilde suffixes."""
-    m = _FIRST_SEG_RE.match(stem)
-    return m.group(1) if m else stem
-
-
 def _build_segment_index(db: IndexDB) -> dict:
     """Map lowercase first-segment → list of JSON paths.
 
@@ -346,15 +336,11 @@ def _build_segment_index(db: IndexDB) -> dict:
     for path, title, stem in rows:
         target = (title or stem or '')
         target_stem = target.rsplit('.', 1)[0] if '.' in target else target
-        seg = _first_segment(target_stem).lower()
-        if len(seg) < _MIN_FIRST_SEG:
+        seg = first_segment(target_stem).lower()
+        if len(seg) < MIN_FIRST_SEG:
             continue
         idx.setdefault(seg, []).append(path)
     return idx
-
-
-# Back-compat alias (existing __main__ import).
-_build_orphan_segment_index = _build_segment_index
 
 
 def cleanup_match_via_index(media_path: Path, seg_idx: dict) -> MatchResult:
@@ -368,8 +354,8 @@ def cleanup_match_via_index(media_path: Path, seg_idx: dict) -> MatchResult:
     same-folder options; the uniqueness constraint is what prevents false
     matches.
     """
-    seg = _first_segment(media_path.stem)
-    if len(seg) < _MIN_FIRST_SEG:
+    seg = first_segment(media_path.stem)
+    if len(seg) < MIN_FIRST_SEG:
         return NO_MATCH
     matches = seg_idx.get(seg.lower(), ())
     if len(matches) == 1:
@@ -377,7 +363,3 @@ def cleanup_match_via_index(media_path: Path, seg_idx: dict) -> MatchResult:
     return NO_MATCH
 
 
-def cleanup_match(media_path: Path, db: IndexDB) -> MatchResult:
-    """Single-file convenience wrapper. For bulk use, build the index once
-    via `_build_segment_index` and call `cleanup_match_via_index`."""
-    return cleanup_match_via_index(media_path, _build_segment_index(db))

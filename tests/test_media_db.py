@@ -5,16 +5,17 @@ from pathlib import Path
 
 import pytest
 
+from gpth_nas._naming import first_segment
 from gpth_nas.index_db import IndexDB
-from gpth_nas.media_db import MediaDB, _first_segment
+from gpth_nas.media_db import MediaDB
 
 
 def test_first_segment():
-    assert _first_segment('IMG_1929') == 'IMG_1929'
-    assert _first_segment('IMG_1929-edited') == 'IMG_1929'
-    assert _first_segment('IMG_1929(1)') == 'IMG_1929'
-    assert _first_segment('IMG_1929~2') == 'IMG_1929'
-    assert _first_segment('bigstockphoto_Woman_Real_Estate_Agent_1926781-e') == \
+    assert first_segment('IMG_1929') == 'IMG_1929'
+    assert first_segment('IMG_1929-edited') == 'IMG_1929'
+    assert first_segment('IMG_1929(1)') == 'IMG_1929'
+    assert first_segment('IMG_1929~2') == 'IMG_1929'
+    assert first_segment('bigstockphoto_Woman_Real_Estate_Agent_1926781-e') == \
         'bigstockphoto_Woman_Real_Estate_Agent_1926781'
 
 

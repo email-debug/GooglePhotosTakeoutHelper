@@ -14,11 +14,17 @@ import pytest
 
 from gpth_nas.index_db import IndexDB
 from gpth_nas.matching import (
-    _build_orphan_segment_index,
-    cleanup_match,
+    _build_segment_index,
     cleanup_match_via_index,
     match_media,
 )
+
+
+def cleanup_match(media_path, db):
+    """Test helper — production callers go through cleanup_match_via_index
+    with a pre-built segment index, but test cases are small enough that
+    rebuilding the index per call is fine."""
+    return cleanup_match_via_index(media_path, _build_segment_index(db))
 
 
 @pytest.fixture
@@ -28,15 +34,19 @@ def db(tmp_path):
 
 
 def _insert(db, full_path: str, title: str):
+    """Seed a JSON sidecar with raw SQL. The `path` column stores the
+    literal posix string the tests assert against, while `parent` is
+    pathlib-normalised so it matches what `match_media` computes via
+    `str(media_path.parent)` — that pair lets the assertions stay
+    posix while the matcher's same-folder query still finds the row
+    on Windows."""
     p = Path(full_path)
-    basename = p.name
-    parent = str(p.parent)
-    stem = IndexDB._stem_of_json(basename)
     db.conn.execute(
         "INSERT OR REPLACE INTO json_files"
         "(path,basename,parent,stem,title,taken_ts,raw_json)"
         " VALUES(?,?,?,?,?,?,?)",
-        (full_path, basename, parent, stem, title, 1700000000, '{}'),
+        (full_path, p.name, str(p.parent), IndexDB._stem_of_json(p.name),
+         title, 1700000000, '{}'),
     )
 
 
