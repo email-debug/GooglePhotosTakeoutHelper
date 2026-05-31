@@ -66,6 +66,30 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument('--force-rematch', action='store_true',
                      help='Re-match every file even if already in processed table.')
 
+    # ── merge-local ────────────────────────────────────────────────────
+    ml = sub.add_parser(
+        'merge-local',
+        help='Merge a non-Google local photo tree into the YYYY/MM archive. '
+             'Dedups against the existing NAS index using EXIF / mp4-atom / '
+             'name+year+size — does not require Google sidecars.',
+    )
+    ml.add_argument('--src', required=True, type=Path,
+                    help='Local tree to merge in (staged on NAS).')
+    ml.add_argument('--dst', required=True, type=Path,
+                    help='Destination archive root — typically /volume1/photo.')
+    ml.add_argument('--db', required=True, type=Path,
+                    help='JSON sidecar index (for EXIF/atom timestamp dedup).')
+    ml.add_argument('--media-db', type=Path, default=None,
+                    help='Media index. Defaults to <db>.media.db.')
+    ml.add_argument('--limit', type=int, default=None,
+                    help='Stop after N files (for testing).')
+    ml.add_argument('--delete-source', action='store_true',
+                    help='Delete each source file after a verified action '
+                         '(copy or confirmed dedup). Off by default — the '
+                         'staging tree is your safety net.')
+    ml.add_argument('--dry-run', action='store_true',
+                    help='Classify and report counts; copy nothing.')
+
     # ── albums-only ────────────────────────────────────────────────────
     alb = sub.add_parser('albums', help='Generate album .lnk shortcuts from an existing output tree.')
     alb.add_argument('--src', required=True, type=Path, help='Original Takeout root (needed for album metadata.json files)')

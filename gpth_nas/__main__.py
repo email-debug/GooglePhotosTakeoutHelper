@@ -38,6 +38,12 @@ from .matching import (
     match_media,
 )
 from .media_db import MediaDB
+from .merge import (
+    classify_local,
+    exif_datetime_ts,
+    mp4_creation_ts,
+    resolve_date,
+)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -555,14 +561,128 @@ def cmd_report(args):
         print_report(db)
 
 
+def cmd_merge_local(args):
+    """Merge a local (non-Google) photo tree into the YYYY/MM archive.
+
+    Dedups against the existing NAS index using EXIF DateTimeOriginal or
+    QuickTime mvhd creation_time (TZ-aware), plus a name+year+size
+    fallback for media without timestamps. Files that don't match anything
+    are copied as new with a date resolved via the same ladder, falling
+    through to filename pattern / folder year / mtime as needed.
+    """
+    mdb_path = _media_db_path(args)
+    counts = {k: 0 for k in (
+        'exif_tz', 'mp4_atom_tz', 'name_size_yr', 'copied_new',
+        'skipped_junk', 'error',
+    )}
+    n_seen = 0
+    n_deleted = 0
+    last_print = time.time()
+
+    with IndexDB(args.db) as idx, MediaDB(mdb_path) as mdb:
+        if idx.count_json() == 0:
+            print('[merge-local] WARN: JSON index is empty — TZ-aware dedup will '
+                  'be a no-op. Run `prescan` first.', file=sys.stderr)
+        if mdb.count() == 0:
+            print('[merge-local] WARN: media index is empty — name+size dedup '
+                  'will be a no-op. Run `prescan` first.', file=sys.stderr)
+
+        mdb.begin()
+        batch = 0
+        for entry in iterative_walk(args.src):
+            if not _is_media(entry.name):
+                # Junk extensions still go through is_junk inside classify
+                # so they show up in the report; but anything outside
+                # known media extensions we don't even look at.
+                continue
+            src_path = Path(entry.path)
+            decision, _nas_path = classify_local(src_path, idx, mdb)
+            counts[decision] += 1
+            n_seen += 1
+
+            if decision == 'copied_new' and not args.dry_run:
+                dest_path = _plan_merge_dest(src_path, args.dst)
+                try:
+                    _copy_with_parents(src_path, dest_path)
+                    mdb.upsert_media(dest_path)
+                except OSError as e:
+                    print(f'\n[merge-local] copy error {src_path} -> {dest_path}: {e}',
+                          file=sys.stderr)
+                    counts['error'] += 1
+                    counts['copied_new'] -= 1
+                    continue
+
+            if args.delete_source and decision != 'error' and not args.dry_run:
+                try:
+                    src_path.unlink()
+                    n_deleted += 1
+                except OSError:
+                    pass
+
+            batch += 1
+            if batch >= 500:
+                mdb.commit()
+                mdb.begin()
+                batch = 0
+            if time.time() - last_print > 2.0:
+                print(f'  [merge-local] seen {n_seen:,} | new {counts["copied_new"]:,} | '
+                      f'dedup {counts["exif_tz"]+counts["mp4_atom_tz"]+counts["name_size_yr"]:,} | '
+                      f'junk {counts["skipped_junk"]:,}', end='\r', flush=True)
+                last_print = time.time()
+            if args.limit and n_seen >= args.limit:
+                break
+        mdb.commit()
+
+    print()
+    print('=== MERGE-LOCAL REPORT ===')
+    print(f'Files seen:        {n_seen:,}')
+    print(f'  exif_tz dedup:   {counts["exif_tz"]:,}')
+    print(f'  mp4_atom dedup:  {counts["mp4_atom_tz"]:,}')
+    print(f'  name+size dedup: {counts["name_size_yr"]:,}')
+    print(f'  copied new:      {counts["copied_new"]:,}')
+    print(f'  skipped junk:    {counts["skipped_junk"]:,}')
+    print(f'  errors:          {counts["error"]:,}')
+    if args.delete_source:
+        print(f'Source files deleted: {n_deleted:,}')
+
+
+def _plan_merge_dest(src_path: Path, dst_root: Path) -> Path:
+    """Decide where in dst_root/YYYY/MM/ a NEW (non-dup) local file lands.
+    Uses the merge module's date-resolution ladder so the directory always
+    reflects the best-guess capture date — never the file's mtime if a
+    better signal exists."""
+    exif_ts = exif_datetime_ts(src_path)
+    mp4_ts = mp4_creation_ts(src_path) if exif_ts is None else None
+    dt = resolve_date(src_path, exif_ts, mp4_ts)
+    yyyy = f'{dt.year:04d}'
+    mm = f'{dt.month:02d}'
+    return dst_root / yyyy / mm / src_path.name
+
+
+def _copy_with_parents(src: Path, dst: Path) -> None:
+    """Copy preserving mtime; mkdir -p the parent. Skips if dest exists
+    AND has the same size — defensive against re-runs without
+    --delete-source. A size mismatch overwrites (the new file may be the
+    higher-quality local original)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        try:
+            if dst.stat().st_size == src.stat().st_size:
+                return
+        except OSError:
+            pass
+    shutil.copy2(src, dst)
+
+
 def main(argv=None):
     args = parse(argv)
     {
-        'extract': cmd_extract,
-        'prescan': cmd_prescan,
-        'run':     cmd_run,
-        'albums':  cmd_albums,
-        'report':  cmd_report,
+        'extract':     cmd_extract,
+        'prescan':     cmd_prescan,
+        'run':         cmd_run,
+        'merge-local': cmd_merge_local,
+        'albums':      cmd_albums,
+        'report':      cmd_report,
     }[args.cmd](args)
 
 
