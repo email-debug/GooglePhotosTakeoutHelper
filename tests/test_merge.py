@@ -110,6 +110,60 @@ def test_tz_aware_residual_too_big(dbs):
     assert hit is None
 
 
+def test_tz_match_requires_size_match_when_media_db_given(dbs):
+    """Same EXIF but different bytes (an edited photo) must NOT match.
+    Otherwise the merge silently drops the user's edit."""
+    idx, media = dbs
+    local_ts = 1_400_000_000
+    _seed_json(idx, '/n/IMG_1.JPG.supplemental-metadata.json', local_ts)
+    # The JSON's `title` is 'IMG_1.JPG.supplemental-metadata'; the matcher
+    # uses title as the basename to look up NAS media. Seed a media row
+    # whose basename matches.
+    idx.conn.execute(
+        "UPDATE json_files SET title=?, parent=? WHERE path=?",
+        ('IMG_1.JPG', '/n', '/n/IMG_1.JPG.supplemental-metadata.json'),
+    )
+    _seed_media(media, '/n/IMG_1.JPG', size=4_000_000)
+
+    # Local file is 2x larger — clearly edited / higher quality. Must not
+    # be skipped.
+    hit = tz_aware_match(local_ts, idx, local_size=8_000_000, media_db=media)
+    assert hit is None
+
+
+def test_tz_match_accepts_close_size(dbs):
+    """Same EXIF + size within 5% → confident dup. Catches Google's
+    same-format recompression without false-positives on edits."""
+    idx, media = dbs
+    local_ts = 1_400_000_000
+    _seed_json(idx, '/n/IMG_1.JPG.supplemental-metadata.json', local_ts)
+    idx.conn.execute(
+        "UPDATE json_files SET title=?, parent=? WHERE path=?",
+        ('IMG_1.JPG', '/n', '/n/IMG_1.JPG.supplemental-metadata.json'),
+    )
+    _seed_media(media, '/n/IMG_1.JPG', size=4_100_000)  # 2.5% smaller
+
+    hit = tz_aware_match(local_ts, idx, local_size=4_000_000, media_db=media)
+    assert hit is not None
+    assert hit[0] == '/n/IMG_1.JPG.supplemental-metadata.json'
+
+
+def test_tz_match_orphan_json_skipped(dbs):
+    """If a NAS JSON has matching taken_ts but the corresponding media
+    file isn't in MediaDB (orphan sidecar), we can't confirm the photo
+    is in the archive. Treat as not-a-dup."""
+    idx, media = dbs
+    local_ts = 1_400_000_000
+    _seed_json(idx, '/n/IMG_1.JPG.supplemental-metadata.json', local_ts)
+    idx.conn.execute(
+        "UPDATE json_files SET title=?, parent=? WHERE path=?",
+        ('IMG_1.JPG', '/n', '/n/IMG_1.JPG.supplemental-metadata.json'),
+    )
+    # No media seeded — sidecar is orphan.
+    hit = tz_aware_match(local_ts, idx, local_size=4_000_000, media_db=media)
+    assert hit is None
+
+
 def test_name_year_size_match(dbs):
     _, media = dbs
     _seed_media(media, '/n/2014/06/IMG_4404.JPG', 4_000_000)

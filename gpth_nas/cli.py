@@ -66,27 +66,40 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument('--force-rematch', action='store_true',
                      help='Re-match every file even if already in processed table.')
 
+    # ── ingest-local ───────────────────────────────────────────────────
+    il = sub.add_parser(
+        'ingest-local',
+        help='One-pass walk of a local tree that computes EXIF / mp4-atom '
+             'timestamps and stores them in a local SQLite index. Lets '
+             'merge-local become pure DB matching with no re-walking.',
+    )
+    il.add_argument('--src', required=True, type=Path,
+                    help='Local tree to ingest.')
+    il.add_argument('--local-db', required=True, type=Path,
+                    help='Path to the local-file SQLite index.')
+    il.add_argument('--limit', type=int, default=None,
+                    help='Stop after N files (for testing).')
+    il.add_argument('--force-rescan', action='store_true',
+                    help='Re-ingest files already in the index.')
+
     # ── merge-local ────────────────────────────────────────────────────
     ml = sub.add_parser(
         'merge-local',
-        help='Merge a non-Google local photo tree into the YYYY/MM archive. '
-             'Dedups against the existing NAS index using EXIF / mp4-atom / '
-             'name+year+size — does not require Google sidecars.',
+        help='Match an ingested local-file index against the NAS index and '
+             'copy non-dups into YYYY/MM. Requires `ingest-local` first.',
     )
-    ml.add_argument('--src', required=True, type=Path,
-                    help='Local tree to merge in (staged on NAS).')
+    ml.add_argument('--local-db', required=True, type=Path,
+                    help='Local-file index produced by `ingest-local`.')
     ml.add_argument('--dst', required=True, type=Path,
                     help='Destination archive root — typically /volume1/photo.')
     ml.add_argument('--db', required=True, type=Path,
                     help='JSON sidecar index (for EXIF/atom timestamp dedup).')
     ml.add_argument('--media-db', type=Path, default=None,
-                    help='Media index. Defaults to <db>.media.db.')
+                    help='NAS media index. Defaults to <db>.media.db.')
     ml.add_argument('--limit', type=int, default=None,
                     help='Stop after N files (for testing).')
     ml.add_argument('--delete-source', action='store_true',
-                    help='Delete each source file after a verified action '
-                         '(copy or confirmed dedup). Off by default — the '
-                         'staging tree is your safety net.')
+                    help='Delete each source file after a verified action.')
     ml.add_argument('--dry-run', action='store_true',
                     help='Classify and report counts; copy nothing.')
 

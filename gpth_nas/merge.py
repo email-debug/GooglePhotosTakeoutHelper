@@ -32,12 +32,21 @@ from typing import Optional, Tuple
 # ── junk filters ────────────────────────────────────────────────────────
 JUNK_EXTS = frozenset({
     '.ico', '.db', '.ini', '.mno', '.html', '.thm', '.lrv', '.bni',
+    '.info', '.albm', '.download', '.zip', '.spj', '.url', '.lnk',
 })
 JUNK_NAMES = frozenset({'thumbs.db', 'desktop.ini'})
+# Filename substrings that mark a file as a thumbnail or low-res preview.
+# Matched case-insensitively against the stem (not the extension).
+JUNK_NAME_SUBSTRINGS = ('low res', '-low', '_lowres', 'lowres', 'thumb',
+                        '_thumb', '_small', '-preview', '_preview')
 # Lowercased path-segment substrings that mark non-photo directories.
 JUNK_PATH_TOKENS = frozenset({
     'icons', 'equilliance', 'web sites', 'resize test', '.tmp.drivedownload',
+    'screenshots',  # Tim's archive convention is photos-only — skip these
 })
+# Lowercased basename prefixes that mark stray screenshots living outside
+# a Screenshots/ folder.
+JUNK_NAME_PREFIXES = ('screenshot ', 'screenshot_')
 
 # ── TZ-aware EXIF match parameters ──────────────────────────────────────
 # Whole-hour TZ offsets we'll accept. 13h covers everything from Hawaii
@@ -54,9 +63,15 @@ _YEAR_RE = re.compile(r'\b(19\d{2}|20\d{2})\b')
 def is_junk(path: Path) -> bool:
     """Path-level filter that drops obvious non-photo files BEFORE EXIF
     reading or DB queries — both cost real wall time on a NAS."""
+    name_lc = path.name.lower()
     if path.suffix.lower() in JUNK_EXTS:
         return True
-    if path.name.lower() in JUNK_NAMES:
+    if name_lc in JUNK_NAMES:
+        return True
+    if name_lc.startswith(JUNK_NAME_PREFIXES):
+        return True
+    stem_lc = path.stem.lower()
+    if any(tok in stem_lc for tok in JUNK_NAME_SUBSTRINGS):
         return True
     parts_lc = [p.lower() for p in path.parts]
     for tok in JUNK_PATH_TOKENS:
@@ -208,23 +223,43 @@ def _parse_mvhd(f, size: int) -> Optional[int]:
 
 # ── TZ-aware match against NAS JSON taken_ts ────────────────────────────
 
-def tz_aware_match(local_ts: int, idx_db) -> Optional[Tuple[str, int]]:
+# How tight a size match has to be to confirm an EXIF/atom dedup. Edited
+# files share the original's EXIF DateTimeOriginal — only the size
+# tells them apart. 5% absorbs same-format Google recompression but
+# flags HEIC→JPG conversions and local edits as distinct content.
+_SIZE_TOL_PCT_DEFAULT = 5
+
+
+def tz_aware_match(
+    local_ts: int,
+    idx_db,
+    local_size: Optional[int] = None,
+    media_db=None,
+    size_tol_pct: int = _SIZE_TOL_PCT_DEFAULT,
+) -> Optional[Tuple[str, int]]:
     """Find a NAS sidecar whose taken_ts differs from local_ts by a
-    whole-hour multiple within ±13h, residual ≤5s. Returns
+    whole-hour TZ offset (within ±13h, residual ≤5s). Returns
     (json_path, offset_hours) or None.
 
-    The integer-hour gate is what makes this safe — two unrelated photos
+    When `media_db` and `local_size` are provided, the match additionally
+    requires the NAS media file's size to be within `size_tol_pct`% of
+    the local file. This is what catches edited variants — they share
+    the original photo's EXIF DateTimeOriginal but differ in bytes —
+    and treats them as new content rather than dropping the edit on the
+    floor.
+
+    The integer-hour gate makes the EXIF half safe: two unrelated photos
     happening to be 6h:00m:03s apart is astronomically unlikely, while
     real TZ deltas always land near an integer hour."""
     window = _TZ_RANGE_HOURS * 3600 + 60
     rows = idx_db.conn.execute(
-        "SELECT path, taken_ts FROM json_files"
+        "SELECT path, parent, title, taken_ts FROM json_files"
         " WHERE taken_ts BETWEEN ? AND ?",
         (local_ts - window, local_ts + window),
     ).fetchall()
     best = None
     best_residual = _TZ_RESIDUAL_S + 1
-    for path, nts in rows:
+    for path, parent, title, nts in rows:
         if nts is None:
             continue
         delta = nts - local_ts
@@ -232,10 +267,57 @@ def tz_aware_match(local_ts: int, idx_db) -> Optional[Tuple[str, int]]:
         if abs(hours) > _TZ_RANGE_HOURS:
             continue
         residual = abs(delta - hours * 3600)
-        if residual <= _TZ_RESIDUAL_S and residual < best_residual:
+        if residual > _TZ_RESIDUAL_S:
+            continue
+        if media_db is not None and local_size:
+            # The JSON's `title` is the original media filename Google
+            # gave it. Looking up that basename in MediaDB (preferring
+            # the same parent folder) yields the NAS file we'd be
+            # deduping against.
+            nas_size = _lookup_media_size(media_db, title, parent)
+            if nas_size is None:
+                # JSON exists but no NAS media — orphan sidecar, can't
+                # confirm the file is in the archive. Skip this row.
+                continue
+            ratio = abs(nas_size - local_size) / max(nas_size, local_size)
+            # Two ways to count as a dup:
+            #   1. Sizes within ±size_tol_pct — same content.
+            #   2. Local is <10% of NAS size — clearly a thumbnail /
+            #      preview / low-res sample, NAS has the real file.
+            #      Without this guard, a 200 KB preview of a 10 MB photo
+            #      would get treated as a new artifact and copied.
+            if ratio <= size_tol_pct / 100.0:
+                pass  # close size → dup
+            elif local_size < 0.10 * nas_size:
+                pass  # thumb/preview → dup
+            else:
+                # Materially different in either direction — an edit, a
+                # crop, a higher-quality original, or a HEIC↔JPG
+                # conversion. NOT a dup; the caller copies it.
+                continue
+        if residual < best_residual:
             best = (path, hours)
             best_residual = residual
     return best
+
+
+def _lookup_media_size(media_db, title: Optional[str], parent: Optional[str]) -> Optional[int]:
+    """NAS media file size for a JSON's title, preferring the same folder
+    as the JSON. Returns None when no media row matches (orphan JSON)."""
+    if not title:
+        return None
+    if parent:
+        r = media_db.conn.execute(
+            "SELECT size_bytes FROM media_files WHERE basename=? AND parent=? LIMIT 1",
+            (title, parent),
+        ).fetchone()
+        if r and r[0]:
+            return r[0]
+    r = media_db.conn.execute(
+        "SELECT size_bytes FROM media_files WHERE basename=? AND size_bytes IS NOT NULL LIMIT 1",
+        (title,),
+    ).fetchone()
+    return r[0] if r else None
 
 
 # ── name + year + size match against NAS media_files ────────────────────
